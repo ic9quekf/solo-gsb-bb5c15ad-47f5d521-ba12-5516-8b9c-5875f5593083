@@ -46,12 +46,18 @@
 - 限值不是有限非负数, 或最多放置枚数不在 0~3;
 - 配重种类为空或超过 6 种; 配重质量非正/非有限; 库存件数非整数或为负;
 - 方案没有已放置试管; 空闲启用槽位超过 16 个(精确枚举规模上限);
-- 摆放明细中试管编号/槽位重复、质量非正、缺少槽位角度; 半径非法。
+- 物理快照无效(由 app/plan_snapshot.py 在搜索前统一解析并交叉核对,
+  三个只读规划器共用): 半径缺失/非正/非有限, 槽位状态缺失、槽号重复或
+  不连续覆盖、角度非有限, 摆放明细中试管编号/槽位重复、质量非正、缺少
+  槽位角度, 明细指向不存在/禁用槽、明细角度与槽角不一致, 明细占用与
+  slot_state 管号缺失/多余/错配或锁定标记矛盾。
 """
 from __future__ import annotations
 
 import math
 from typing import Any, Optional
+
+from .plan_snapshot import parse_plan_snapshot
 
 # 精确枚举规模上限: 空闲启用槽 16 个、配重 6 种、放置上限 3 枚
 # (叶子数 Σ_{k=0..3} C(16,k)·6^k ≈ 12.6 万)
@@ -95,7 +101,10 @@ def plan_counterweight_compensation(
     plan_id = plan.get("id")
 
     # ---- 限值 / 放置上限 ----
-    limit = float(u1_limit_g_mm)
+    try:
+        limit = float(u1_limit_g_mm)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("一阶不平衡量限值必须为有限数值。") from exc
     if not math.isfinite(limit):
         raise ValueError("一阶不平衡量限值必须为有限数值。")
     if limit < 0.0:
@@ -103,6 +112,10 @@ def plan_counterweight_compensation(
     M = int(max_weights)
     if not (0 <= M <= MAX_WEIGHTS):
         raise ValueError(f"最多放置枚数必须在 0~{MAX_WEIGHTS} 之间(当前 {M})。")
+
+    # ---- 物理快照(搜索前统一解析: 半径/槽角/占用交叉核对, 无效即 400) ----
+    snap = parse_plan_snapshot(plan)
+    radius = snap.radius_mm
 
     # ---- 配重种类入参 ----
     if not isinstance(weights, (list, tuple)) or not weights:
@@ -148,73 +161,30 @@ def plan_counterweight_compensation(
         {"mass_g": m, "stock": stock_by_mass[m]} for m in usable_masses
     ]
 
-    # ---- 半径 ----
-    result = plan.get("result") or {}
-    cfg = result.get("config") or {}
-    radius = cfg.get("radius_mm")
-    if radius is None:
-        radius = (plan.get("request") or {}).get("radius_mm", 100.0)
-    radius = float(radius)
-    if not math.isfinite(radius) or radius <= 0.0:
-        raise ValueError("方案中的转子半径必须为正数。")
-
-    # ---- 摆放明细(补偿前不平衡量) ----
-    used = [p for p in (result.get("placements") or [])
-            if p.get("slot") is not None]
-    if not used:
+    # ---- 补偿前不平衡量(快照已完成编号/槽位/质量/角度与占用交叉核对) ----
+    if not snap.tubes:
         raise ValueError(
             f"方案 {plan_id} 没有已放置的试管, 无法进行库存配重补偿。"
         )
-    seen_ids: set[int] = set()
-    seen_slots: set[int] = set()
-    base_x = base_y = 0.0
-    for p in used:
-        tid = int(p["tube_id"])
-        if tid in seen_ids:
-            raise ValueError(f"摆放明细中试管 {tid} 重复。")
-        seen_ids.add(tid)
-        slot = int(p["slot"])
-        if slot in seen_slots:
-            raise ValueError(f"摆放明细中槽位 {slot} 被重复占用。")
-        seen_slots.add(slot)
-        mass = float(p["mass"])
-        if not math.isfinite(mass) or mass <= 0.0:
-            raise ValueError(f"试管 {tid} 的标称质量必须为正数。")
-        angle = p.get("angle")
-        if angle is None or not math.isfinite(float(angle)):
-            raise ValueError(f"试管 {tid} 的摆放结果缺少有效槽位角度。")
-        a = math.radians(float(angle))
-        base_x += mass * radius * math.cos(a)
-        base_y += mass * radius * math.sin(a)
-    tube_count = len(used)
+    base_vec = snap.base_vector
+    base_x, base_y = base_vec.real, base_vec.imag
+    tube_count = len(snap.tubes)
     baseline_block = _vec_block(base_x, base_y)
 
-    # ---- 空闲启用槽位(以方案结果 slot_state 为准) ----
-    slot_state = result.get("slot_state") or []
-    if not slot_state:
-        raise ValueError(
-            f"方案 {plan_id} 缺少槽位状态信息, 无法进行库存配重补偿。"
-        )
-    free_slots: list[dict[str, Any]] = []
-    for item in slot_state:
-        idx = int(item["slot"])
-        ang = float(item["angle"])
-        if not math.isfinite(ang):
-            raise ValueError(f"槽位 {idx} 的角度必须为有限数值。")
-        if bool(item.get("enabled", True)) and item.get("tube_id") is None:
-            free_slots.append({"slot": idx, "angle_deg": ang})
-    free_slots.sort(key=lambda f: f["slot"])
+    # ---- 空闲启用槽位(以方案结果 slot_state 为准, 快照已交叉核对占用) ----
+    free_slots = [
+        {"slot": s, "angle_deg": snap.slots[s]["angle_deg"]}
+        for s in snap.free_enabled_slots
+    ]
     q = len(free_slots)
     if q > MAX_FREE_SLOTS:
         raise ValueError(
             f"方案有 {q} 个空闲启用槽位, 超过库存配重补偿上限 "
             f"{MAX_FREE_SLOTS} 个(精确枚举规模随空槽数增长), 明确拒绝。"
         )
-    # 各空槽方向的单位质径积向量 R·e^{iθ}
+    # 各空槽方向的单位质径积向量 R·e^{iθ}(与其他规划器共用快照向量计算)
     unit_vecs = [
-        complex(radius * math.cos(math.radians(f["angle_deg"])),
-                radius * math.sin(math.radians(f["angle_deg"])))
-        for f in free_slots
+        snap.mass_radius_vector(1.0, f["slot"]) for f in free_slots
     ]
 
     # ---- 按放置枚数分层的完全枚举 ----
@@ -302,9 +272,9 @@ def plan_counterweight_compensation(
     placements_out: list[dict[str, Any]] = []
     ux, uy = base_x, base_y
     for slot, mass in zip(chosen_slots, chosen_masses):
-        a = math.radians(angle_of[slot])
-        vx = mass * radius * math.cos(a)
-        vy = mass * radius * math.sin(a)
+        # 与其他规划器共用快照的质径积向量计算(角度以槽位状态为准)
+        v = snap.mass_radius_vector(mass, slot)
+        vx, vy = v.real, v.imag
         ux += vx
         uy += vy
         placements_out.append({

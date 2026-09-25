@@ -300,6 +300,54 @@ class TestSpareReplacement(unittest.TestCase):
             plan_spare_replacement(
                 empty, [1], good_spares, u1_limit_g_mm=100.0)
 
+    def test_inconsistent_snapshot_rejected_before_search(self):
+        """半径/槽角/占用矛盾的快照必须在枚举前拒绝, 不产生替换建议。"""
+        p = _balanced_plan()
+        replaced = [1]
+        spares = [{"tube_id": 10, "mass_g": 50.0}]
+        # 半径缺失(config 与 request 均无)
+        bad = copy.deepcopy(p)
+        del bad["result"]["config"]["radius_mm"]
+        del bad["request"]["radius_mm"]
+        with self.assertRaises(ValueError):
+            plan_spare_replacement(bad, replaced, spares,
+                                   u1_limit_g_mm=100.0)
+        # 槽位状态缺失
+        bad = copy.deepcopy(p)
+        del bad["result"]["slot_state"]
+        with self.assertRaises(ValueError):
+            plan_spare_replacement(bad, replaced, spares,
+                                   u1_limit_g_mm=100.0)
+        # 明细落在不存在的槽
+        bad = copy.deepcopy(p)
+        bad["result"]["placements"][0]["slot"] = 40
+        with self.assertRaises(ValueError):
+            plan_spare_replacement(bad, replaced, spares,
+                                   u1_limit_g_mm=100.0)
+        # 明细角度与槽角矛盾
+        bad = copy.deepcopy(p)
+        bad["result"]["placements"][0]["angle"] = 123.0
+        with self.assertRaises(ValueError):
+            plan_spare_replacement(bad, replaced, spares,
+                                   u1_limit_g_mm=100.0)
+        # 占用矛盾: 槽状态管号与明细不符
+        bad = copy.deepcopy(p)
+        bad["result"]["slot_state"][0]["tube_id"] = 7
+        with self.assertRaises(ValueError):
+            plan_spare_replacement(bad, replaced, spares,
+                                   u1_limit_g_mm=100.0)
+        # locked 矛盾
+        bad = copy.deepcopy(p)
+        bad["result"]["slot_state"][0]["locked"] = True
+        with self.assertRaises(ValueError):
+            plan_spare_replacement(bad, replaced, spares,
+                                   u1_limit_g_mm=100.0)
+        # 快照无效优先于其他入参校验(待换管列表为空也先返回快照 400)
+        bad = copy.deepcopy(p)
+        bad["result"]["placements"][0]["angle"] = 123.0
+        with self.assertRaises(ValueError):
+            plan_spare_replacement(bad, [], spares, u1_limit_g_mm=100.0)
+
     def test_random_against_brute_force(self):
         rng = random.Random(20260925)
         for trial in range(80):

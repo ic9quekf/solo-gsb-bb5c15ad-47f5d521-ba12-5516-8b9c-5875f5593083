@@ -1259,6 +1259,102 @@ assert sp_after["result"]["metrics"]["u1_mag_g_mm"] == \
        rec_sp["result"]["metrics"]["u1_mag_g_mm"]
 print("spare-replacement validation/read-only OK")
 
+# ---- 损坏的已保存快照: 三个只读规划接口必须在搜索前统一返回 400 ----
+# 直接改库中 result_json, 模拟旧版本/手工导出导致的物理快照矛盾
+import sqlite3 as _sqlite3  # noqa: F401
+
+
+def _corrupt_saved_plan(plan_id, mutate_fn):
+    with main.db() as _conn:
+        _row = _conn.execute(
+            "SELECT result_json FROM plans WHERE id = ?", (plan_id,)
+        ).fetchone()
+    _result = json.loads(_row["result_json"])
+    mutate_fn(_result)
+    with main.db() as _conn:
+        _conn.execute(
+            "UPDATE plans SET result_json = ? WHERE id = ?",
+            (json.dumps(_result, ensure_ascii=False), plan_id),
+        )
+
+
+def _assert_snapshot_400(label, invoke):
+    try:
+        invoke(); raise SystemExit(f"{label}: should 400 on corrupt snapshot")
+    except main.HTTPException as _e:
+        assert _e.status_code == 400, (label, _e.status_code, _e.detail)
+        assert _e.detail, (label, "400 必须给出明确原因")
+
+
+# 1) 摆放角度与槽位状态槽角矛盾
+for _pid, _invoke in (
+    (evid2, lambda: ev_call(evid2, [1], 1.0, 1)),
+    (cwid, lambda: cw_call(cwid, [(5, 1)], 1.0, 1)),
+    (spid, lambda: sp_call(spid, [1], [(10, 50.0)], 100.0)),
+):
+    _corrupt_saved_plan(
+        _pid, lambda r: r["placements"][0].__setitem__("angle", 1.2345))
+    _assert_snapshot_400(f"angle mismatch plan#{_pid}", _invoke)
+# 恢复并验证正常方案结果仍可规划
+for _pid, _rec in ((evid2, recv2), (cwid, rec_cw), (spid, rec_sp)):
+    with main.db() as _conn:
+        _conn.execute(
+            "UPDATE plans SET result_json = ? WHERE id = ?",
+            (json.dumps(_rec["result"], ensure_ascii=False), _pid),
+        )
+assert ev_call(evid2, [9], 1e9, 3)["feasible"] is True
+assert cw_call(cwid, [(50, 3)], 6000.0, 3)["feasible"] is True
+assert sp_call(spid, [1], [(10, 50.0)], 100.0)["feasible"] is True
+
+# 2) 占用关系矛盾(slot_state 管号与明细不符) + 半径非法
+for _pid, _invoke in (
+    (evid2, lambda: ev_call(evid2, [1], 1.0, 1)),
+    (cwid, lambda: cw_call(cwid, [(5, 1)], 1.0, 1)),
+    (spid, lambda: sp_call(spid, [1], [(10, 50.0)], 100.0)),
+):
+    _corrupt_saved_plan(
+        _pid,
+        lambda r: (
+            r["slot_state"][0].__setitem__("tube_id", 999999),
+            r["config"].__setitem__("radius_mm", -7.0),
+        ),
+    )
+    _assert_snapshot_400(f"contradictory plan#{_pid}", _invoke)
+# 恢复
+for _pid, _rec in ((evid2, recv2), (cwid, rec_cw), (spid, rec_sp)):
+    with main.db() as _conn:
+        _conn.execute(
+            "UPDATE plans SET result_json = ? WHERE id = ?",
+            (json.dumps(_rec["result"], ensure_ascii=False), _pid),
+        )
+# 3) 槽号缺失(不连续覆盖): 即使入参本身为空/非法, 也先报快照 400
+_corrupt_saved_plan(
+    evid2, lambda r: r["slot_state"][-1].__setitem__("slot", 99))
+_assert_snapshot_400(
+    "evacuation empty failed list",
+    lambda: ev_call(evid2, [], -1.0, 9))
+_corrupt_saved_plan(
+    cwid, lambda r: r["slot_state"][-1].__setitem__("slot", 99))
+_assert_snapshot_400(
+    "counterweight empty weights",
+    lambda: cw_call(cwid, [], 1.0, 1))
+_corrupt_saved_plan(
+    spid, lambda r: r["slot_state"][-1].__setitem__("slot", 99))
+_assert_snapshot_400(
+    "spare replacement empty replaced",
+    lambda: sp_call(spid, [], [(10, 50.0)], 100.0))
+# 恢复后三条方案规划结果不变
+for _pid, _rec in ((evid2, recv2), (cwid, rec_cw), (spid, rec_sp)):
+    with main.db() as _conn:
+        _conn.execute(
+            "UPDATE plans SET result_json = ? WHERE id = ?",
+            (json.dumps(_rec["result"], ensure_ascii=False), _pid),
+        )
+assert ev_call(evid2, [9], 1e9, 3)["feasible"] is True
+assert cw_call(cwid, [(50, 3)], 6000.0, 3)["feasible"] is True
+assert sp_call(spid, [1], [(10, 50.0)], 100.0)["feasible"] is True
+print("corrupt-snapshot pre-search 400 for three planners OK")
+
 
 # ---- 互斥试管隔离(精确完全枚举; 禁用槽仍占物理相邻关系) ----
 import itertools as _itx

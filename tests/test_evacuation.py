@@ -373,6 +373,53 @@ class TestSlotEvacuation(unittest.TestCase):
             plan_slot_evacuation(p_ang, failed_slots=[2],
                                  u1_limit_g_mm=1.0, max_moves=1)
 
+    def test_inconsistent_snapshot_rejected_before_search(self):
+        """半径/槽角/占用矛盾的快照必须在枚举前拒绝, 不产生迁移建议。"""
+        p = _plan(1, {0: (1, 50.0, False), 6: (2, 50.0, False)})
+        kwargs = {"failed_slots": [1], "u1_limit_g_mm": 100.0,
+                  "max_moves": 1}
+        # 半径非有限
+        bad = copy.deepcopy(p)
+        bad["result"]["config"]["radius_mm"] = float("inf")
+        with self.assertRaises(ValueError):
+            plan_slot_evacuation(bad, **kwargs)
+        # 槽位状态为空
+        bad = copy.deepcopy(p)
+        bad["result"]["slot_state"] = []
+        with self.assertRaises(ValueError):
+            plan_slot_evacuation(bad, **kwargs)
+        # 槽号缺失(不连续覆盖)
+        bad = copy.deepcopy(p)
+        bad["result"]["slot_state"][11]["slot"] = 12
+        with self.assertRaises(ValueError):
+            plan_slot_evacuation(bad, **kwargs)
+        # 明细角度与槽角矛盾
+        bad = copy.deepcopy(p)
+        bad["result"]["placements"][0]["angle"] = 90.0
+        with self.assertRaises(ValueError):
+            plan_slot_evacuation(bad, **kwargs)
+        # 占用关系矛盾: slot_state 标注的管号与明细不符
+        bad = copy.deepcopy(p)
+        bad["result"]["slot_state"][0]["tube_id"] = 5
+        with self.assertRaises(ValueError):
+            plan_slot_evacuation(bad, **kwargs)
+        # 明细占用但槽状态标空(占用缺失)
+        bad = copy.deepcopy(p)
+        bad["result"]["slot_state"][6]["tube_id"] = None
+        with self.assertRaises(ValueError):
+            plan_slot_evacuation(bad, **kwargs)
+        # locked 矛盾
+        bad = copy.deepcopy(p)
+        bad["result"]["placements"][0]["locked"] = True
+        with self.assertRaises(ValueError):
+            plan_slot_evacuation(bad, **kwargs)
+        # 快照无效时即使失效槽列表也为空, 仍须在搜索前 400
+        bad = copy.deepcopy(p)
+        bad["result"]["placements"][0]["angle"] = 90.0
+        with self.assertRaises(ValueError):
+            plan_slot_evacuation(bad, failed_slots=[],
+                                 u1_limit_g_mm=100.0, max_moves=1)
+
     def test_read_only(self):
         p = _plan(1, {0: (1, 50.0, False), 6: (2, 50.0, True),
                       3: (3, 30.0, False)})

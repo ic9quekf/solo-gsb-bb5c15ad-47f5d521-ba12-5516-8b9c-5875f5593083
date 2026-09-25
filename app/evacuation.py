@@ -50,13 +50,19 @@
 - 限值不是有限非负数, 或 max_moves 不在 0~3;
 - 失效槽位列表为空、含不存在槽位、含原本禁用槽位或重复槽位;
 - 方案没有已放置试管、已放置试管超过 10 支或启用槽位超过 16 个;
-- 摆放明细中试管编号/槽位重复、质量非正、缺少槽位角度; 半径非法。
+- 物理快照无效(由 app/plan_snapshot.py 在搜索前统一解析并交叉核对,
+  三个只读规划器共用): 半径缺失/非正/非有限, 槽位状态缺失、槽号重复或
+  不连续覆盖、角度非有限, 摆放明细中试管编号/槽位重复、质量非正、缺少
+  槽位角度, 明细指向不存在/禁用槽、明细角度与槽角不一致, 明细占用与
+  slot_state 管号缺失/多余/错配或锁定标记矛盾。
 """
 from __future__ import annotations
 
 import math
 from itertools import combinations
 from typing import Any, Optional
+
+from .plan_snapshot import parse_plan_snapshot
 
 # 搜索规模上限: 试管 10 支、启用槽 16 个、移动上限 3
 MAX_TUBES = 10
@@ -97,7 +103,10 @@ def plan_slot_evacuation(plan: dict[str, Any],
     plan_id = plan.get("id")
 
     # ---- 限值 / 移动上限 ----
-    limit = float(u1_limit_g_mm)
+    try:
+        limit = float(u1_limit_g_mm)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("一阶不平衡量限值必须为有限数值。") from exc
     if not math.isfinite(limit):
         raise ValueError("一阶不平衡量限值必须为有限数值。")
     if limit < 0.0:
@@ -106,15 +115,10 @@ def plan_slot_evacuation(plan: dict[str, Any],
     if not (0 <= M <= MAX_MOVES):
         raise ValueError(f"最多可移动管数必须在 0~{MAX_MOVES} 之间(当前 {M})。")
 
-    # ---- 半径 ----
-    result = plan.get("result") or {}
-    cfg = result.get("config") or {}
-    radius = cfg.get("radius_mm")
-    if radius is None:
-        radius = (plan.get("request") or {}).get("radius_mm", 100.0)
-    radius = float(radius)
-    if not math.isfinite(radius) or radius <= 0.0:
-        raise ValueError("方案中的转子半径必须为正数。")
+    # ---- 物理快照(搜索前统一解析: 半径/槽角/占用交叉核对, 无效即 400) ----
+    snap = parse_plan_snapshot(plan)
+    radius = snap.radius_mm
+    slot_info = snap.slots
 
     # ---- 失效槽位入参 ----
     if not isinstance(failed_slots, (list, tuple)) or not failed_slots:
@@ -126,20 +130,6 @@ def plan_slot_evacuation(plan: dict[str, Any],
             raise ValueError(f"失效槽位 {s} 重复填写。")
         failed.append(s)
     failed_set = set(failed)
-
-    # ---- 槽位几何(以方案结果 slot_state 为准) ----
-    slot_state = result.get("slot_state") or []
-    if not slot_state:
-        raise ValueError(
-            f"方案 {plan_id} 缺少槽位状态信息, 无法进行失效槽位应急迁移。"
-        )
-    slot_info: dict[int, dict[str, Any]] = {}
-    for item in slot_state:
-        idx = int(item["slot"])
-        ang = float(item["angle"])
-        if not math.isfinite(ang):
-            raise ValueError(f"槽位 {idx} 的角度必须为有限数值。")
-        slot_info[idx] = {"angle": ang, "enabled": bool(item.get("enabled", True))}
     for s in failed:
         info = slot_info.get(s)
         if info is None:
@@ -150,63 +140,47 @@ def plan_slot_evacuation(plan: dict[str, Any],
                 "(应急迁移只接受原本启用的槽位)。"
             )
 
-    # ---- 摆放明细 ----
-    used = [p for p in (result.get("placements") or [])
-            if p.get("slot") is not None]
-    if not used:
+    # ---- 已放置试管(快照已完成编号/槽位/质量/角度与占用交叉核对) ----
+    if not snap.tubes:
         raise ValueError(
             f"方案 {plan_id} 没有已放置的试管, 无法进行失效槽位应急迁移。"
         )
-    if len(used) > MAX_TUBES:
+    if len(snap.tubes) > MAX_TUBES:
         raise ValueError(
-            f"方案 {plan_id} 有 {len(used)} 支已放置试管, 超过失效槽位应急迁移"
-            f"上限 {MAX_TUBES} 支(精确枚举搜索规模随管数组合增长), 明确拒绝。"
+            f"方案 {plan_id} 有 {len(snap.tubes)} 支已放置试管, 超过失效槽位"
+            f"应急迁移上限 {MAX_TUBES} 支(精确枚举搜索规模随管数组合增长), "
+            "明确拒绝。"
         )
-    enabled_count = sum(1 for info in slot_info.values() if info["enabled"])
+    enabled_count = len(snap.enabled_slots)
     if enabled_count > MAX_ENABLED_SLOTS:
         raise ValueError(
             f"方案有 {enabled_count} 个启用槽位, 超过失效槽位应急迁移上限 "
             f"{MAX_ENABLED_SLOTS} 个, 明确拒绝。"
         )
 
-    tubes: list[dict[str, Any]] = []
-    seen_ids: set[int] = set()
-    seen_slots: set[int] = set()
-    for p in used:
-        tid = int(p["tube_id"])
-        if tid in seen_ids:
-            raise ValueError(f"摆放明细中试管 {tid} 重复。")
-        seen_ids.add(tid)
-        slot = int(p["slot"])
-        if slot in seen_slots:
-            raise ValueError(f"摆放明细中槽位 {slot} 被重复占用。")
-        seen_slots.add(slot)
-        mass = float(p["mass"])
-        if not math.isfinite(mass) or mass <= 0.0:
-            raise ValueError(f"试管 {tid} 的标称质量必须为正数。")
-        angle = p.get("angle")
-        if angle is None or not math.isfinite(float(angle)):
-            raise ValueError(f"试管 {tid} 的摆放结果缺少有效槽位角度。")
-        tubes.append({
-            "tube_id": tid,
-            "origin": slot,
-            "angle_deg": float(angle),
-            "mass": mass,
-            "locked": bool(p.get("locked", False)),
-        })
     # 管号升序: 并列裁决的目标槽位序列即按此顺序
-    tubes.sort(key=lambda t: t["tube_id"])
+    tubes: list[dict[str, Any]] = [
+        {
+            "tube_id": t.tube_id,
+            "origin": t.slot,
+            "angle_deg": t.angle_deg,
+            "mass": t.mass_g,
+            "locked": t.locked,
+        }
+        for t in snap.tubes
+    ]
     n = len(tubes)
 
     def _vector(j: int, slot: int) -> complex:
-        """试管 j 放到 slot 时的质径积向量 R·m·e^{iθ}(g·mm)。"""
-        a = math.radians(slot_info[slot]["angle"])
-        m = tubes[j]["mass"] * radius
-        return complex(m * math.cos(a), m * math.sin(a))
+        """试管 j 放到 slot 时的质径积向量 R·m·e^{iθ}(g·mm)。
+
+        与库存配重/备品替换共用快照的同一向量计算(角度以槽位状态为准)。
+        """
+        return snap.mass_radius_vector(tubes[j]["mass"], slot)
 
     # 各管在原槽的向量; 总向量(迁移前)
-    origin_vec = [_vector(j, tubes[j]["origin"]) for j in range(n)]
-    total_vec = sum(origin_vec, 0j)
+    origin_vec = [snap.tubes[j].vector for j in range(n)]
+    total_vec = snap.base_vector
     original_block = _vec_block(total_vec.real, total_vec.imag)
 
     # 失效槽占用情况
@@ -225,7 +199,7 @@ def plan_slot_evacuation(plan: dict[str, Any],
         occ = next((j for j in range(n) if tubes[j]["origin"] == s), None)
         failed_rows.append({
             "slot": s,
-            "angle_deg": slot_info[s]["angle"],
+            "angle_deg": slot_info[s]["angle_deg"],
             "occupied_by_tube": (tubes[occ]["tube_id"] if occ is not None else None),
             "locked": (tubes[occ]["locked"] if occ is not None else False),
         })
@@ -243,7 +217,7 @@ def plan_slot_evacuation(plan: dict[str, Any],
                 "original_angle_deg": t["angle_deg"],
                 "final_slot": target,
                 "final_angle_deg": (
-                    slot_info[target]["angle"] if target is not None else None
+                    slot_info[target]["angle_deg"] if target is not None else None
                 ),
                 "moved": moved,
             })

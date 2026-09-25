@@ -47,13 +47,19 @@ s 支**备品试管**(1 ≤ s ≤ 12, 编号互不相同, 质量为正, 且编�
 - 备品数量为 0 或超过 12、备品编号重复/非整数、质量非正或非有限;
 - 备品编号与原方案试管编号(含未放置试管)冲突;
 - 备品数量少于待换管数(无法构成一对一不重复映射);
-- 方案没有已放置试管; 摆放明细中试管编号/槽位重复、质量非正、缺少槽位角度;
-- 半径非法。
+- 方案没有已放置试管;
+- 物理快照无效(由 app/plan_snapshot.py 在搜索前统一解析并交叉核对,
+  三个只读规划器共用): 半径缺失/非正/非有限, 槽位状态缺失、槽号重复或
+  不连续覆盖、角度非有限, 摆放明细中试管编号/槽位重复、质量非正、缺少
+  槽位角度, 明细指向不存在/禁用槽、明细角度与槽角不一致, 明细占用与
+  slot_state 管号缺失/多余/错配或锁定标记矛盾。
 """
 from __future__ import annotations
 
 import math
-from typing import Any, Optional
+from typing import Any
+
+from .plan_snapshot import parse_plan_snapshot
 
 # 精确枚举规模上限: 待换管 4 支、备品 12 支(排列数 P(12,4)=11880)
 MAX_REPLACE = 4
@@ -104,22 +110,19 @@ def plan_spare_replacement(plan: dict[str, Any],
     plan_id = plan.get("id")
 
     # ---- 限值 ----
-    limit = float(u1_limit_g_mm)
+    try:
+        limit = float(u1_limit_g_mm)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("一阶不平衡量限值必须为有限数值。") from exc
     if not math.isfinite(limit):
         raise ValueError("一阶不平衡量限值必须为有限数值。")
     if limit < 0.0:
         raise ValueError("一阶不平衡量限值不能为负。")
 
-    # ---- 半径 / 转速 ----
-    result = plan.get("result") or {}
-    cfg = result.get("config") or {}
-    radius = cfg.get("radius_mm")
-    if radius is None:
-        radius = (plan.get("request") or {}).get("radius_mm", 100.0)
-    radius = float(radius)
-    if not math.isfinite(radius) or radius <= 0.0:
-        raise ValueError("方案中的转子半径必须为正数。")
-    rpm = float(cfg.get("rpm", (plan.get("request") or {}).get("rpm", 0.0)))
+    # ---- 物理快照(搜索前统一解析: 半径/槽角/占用交叉核对, 无效即 400) ----
+    snap = parse_plan_snapshot(plan)
+    radius = snap.radius_mm
+    rpm = snap.rpm
     omega = 2.0 * math.pi * rpm / 60.0
 
     # ---- 待换管入参 ----
@@ -136,53 +139,28 @@ def plan_spare_replacement(plan: dict[str, Any],
             raise ValueError(f"待换管 {tid} 重复选择。")
         replaced_ids.append(tid)
 
-    # ---- 摆放明细 ----
-    used = [p for p in (result.get("placements") or [])
-            if p.get("slot") is not None]
-    if not used:
+    # ---- 已放置试管(快照已完成编号/槽位/质量/角度与占用交叉核对) ----
+    if not snap.tubes:
         raise ValueError(
             f"方案 {plan_id} 没有已放置的试管, 无法进行备品试管替换。"
         )
-    placed: dict[int, dict[str, Any]] = {}
-    seen_slots: set[int] = set()
-    base_x = base_y = 0.0
-    base_total_mass = 0.0
-    for p in used:
-        tid = _as_int(p.get("tube_id"), "摆放明细中的试管编号")
-        if tid in placed:
-            raise ValueError(f"摆放明细中试管 {tid} 重复。")
-        slot = _as_int(p.get("slot"), f"试管 {tid} 的槽位")
-        if slot in seen_slots:
-            raise ValueError(f"摆放明细中槽位 {slot} 被重复占用。")
-        seen_slots.add(slot)
-        mass = float(p.get("mass"))
-        if not math.isfinite(mass) or mass <= 0.0:
-            raise ValueError(f"试管 {tid} 的标称质量必须为正数。")
-        angle = p.get("angle")
-        if angle is None or not math.isfinite(float(angle)):
-            raise ValueError(f"试管 {tid} 的摆放结果缺少有效槽位角度。")
-        angle_deg = float(angle)
-        a = math.radians(angle_deg)
-        vx = mass * radius * math.cos(a)
-        vy = mass * radius * math.sin(a)
-        base_x += vx
-        base_y += vy
-        base_total_mass += mass
-        placed[tid] = {
-            "tube_id": tid,
-            "mass": mass,
-            "slot": slot,
-            "angle_deg": angle_deg,
-            "locked": bool(p.get("locked", False)),
-            "vec": (vx, vy),
+    base_x, base_y = snap.base_vector.real, snap.base_vector.imag
+    base_total_mass = sum(t.mass_g for t in snap.tubes)
+    placed: dict[int, dict[str, Any]] = {
+        t.tube_id: {
+            "tube_id": t.tube_id,
+            "mass": t.mass_g,
+            "slot": t.slot,
+            "angle_deg": t.angle_deg,
+            "locked": t.locked,
+            "vec": (t.vector.real, t.vector.imag),
         }
+        for t in snap.tubes
+    }
     n = len(placed)
 
     # 原方案全部试管编号(含未放置的), 备品编号不得与之冲突
-    original_ids = set(placed)
-    for p in (result.get("placements") or []):
-        if p.get("tube_id") is not None:
-            original_ids.add(_as_int(p.get("tube_id"), "摆放明细中的试管编号"))
+    original_ids = set(placed) | set(snap.unplaced_tube_ids)
     for t in ((plan.get("request") or {}).get("tubes") or []):
         if isinstance(t, dict) and t.get("id") is not None:
             original_ids.add(_as_int(t.get("id"), "方案试管编号"))
@@ -253,11 +231,11 @@ def plan_spare_replacement(plan: dict[str, Any],
         })
     unchanged_rows.sort(key=lambda r: r["slot"])
 
-    # 待换管原槽方向的单位质径积向量 R·e^{iθ}
+    # 待换管原槽方向的单位质径积向量 R·e^{iθ}(共用快照向量计算)
     rep_dirs = []
     for tid in replaced_ids:
-        a = math.radians(placed[tid]["angle_deg"])
-        rep_dirs.append((radius * math.cos(a), radius * math.sin(a)))
+        v = snap.mass_radius_vector(1.0, placed[tid]["slot"])
+        rep_dirs.append((v.real, v.imag))
 
     # ---- 备品不重复使用的一对一完全枚举(排列) ----
     # 叶子: (|U₁|, 总质量差 D, 备品编号序列(按待换管号升序位置))
@@ -329,10 +307,9 @@ def plan_spare_replacement(plan: dict[str, Any],
         tid = replaced_ids[pos]
         t = placed[tid]
         smass = spare_by_id[sid]
-        a = math.radians(t["angle_deg"])
         ovx, ovy = t["vec"]
-        fvx = smass * radius * math.cos(a)
-        fvy = smass * radius * math.sin(a)
+        fv = snap.mass_radius_vector(smass, t["slot"])
+        fvx, fvy = fv.real, fv.imag
         final_x += fvx
         final_y += fvy
         diff = smass - t["mass"]

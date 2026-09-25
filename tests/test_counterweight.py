@@ -311,6 +311,43 @@ class TestCounterweightCompensation(unittest.TestCase):
             plan_counterweight_compensation(
                 empty, good, u1_limit_g_mm=100.0, max_weights=1)
 
+    def test_inconsistent_snapshot_rejected_before_search(self):
+        """半径/槽角/占用矛盾的快照必须在枚举前拒绝, 不产生配重建议。"""
+        p = _single_plan()
+        good = [{"mass_g": 5.0, "stock": 1}]
+        kwargs = {"weights": good, "u1_limit_g_mm": 100.0, "max_weights": 1}
+        # 半径非正
+        bad = copy.deepcopy(p)
+        bad["result"]["config"]["radius_mm"] = 0.0
+        with self.assertRaises(ValueError):
+            plan_counterweight_compensation(bad, **kwargs)
+        # 槽位状态缺失
+        bad = copy.deepcopy(p)
+        del bad["result"]["slot_state"]
+        with self.assertRaises(ValueError):
+            plan_counterweight_compensation(bad, **kwargs)
+        # 明细角度与槽角矛盾
+        bad = copy.deepcopy(p)
+        bad["result"]["placements"][0]["angle"] = 17.0
+        with self.assertRaises(ValueError):
+            plan_counterweight_compensation(bad, **kwargs)
+        # 占用关系矛盾: 空槽状态标注的管号与明细不一致
+        bad = copy.deepcopy(p)
+        bad["result"]["slot_state"][0]["tube_id"] = 99
+        with self.assertRaises(ValueError):
+            plan_counterweight_compensation(bad, **kwargs)
+        # 槽状态标注占用但明细缺失(多余占用)
+        bad = copy.deepcopy(p)
+        bad["result"]["placements"] = []
+        with self.assertRaises(ValueError):
+            plan_counterweight_compensation(bad, **kwargs)
+        # 即使其他入参也非法(配重为空), 快照无效仍先返回 400
+        bad = copy.deepcopy(p)
+        bad["result"]["placements"][0]["angle"] = 17.0
+        with self.assertRaises(ValueError):
+            plan_counterweight_compensation(
+                bad, [], u1_limit_g_mm=100.0, max_weights=1)
+
     def test_random_against_brute_force(self):
         rng = random.Random(20260925)
         for trial in range(60):
