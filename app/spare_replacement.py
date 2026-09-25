@@ -47,28 +47,23 @@ s 支**备品试管**(1 ≤ s ≤ 12, 编号互不相同, 质量为正, 且编�
 - 备品数量为 0 或超过 12、备品编号重复/非整数、质量非正或非有限;
 - 备品编号与原方案试管编号(含未放置试管)冲突;
 - 备品数量少于待换管数(无法构成一对一不重复映射);
-- 方案没有已放置试管; 摆放明细中试管编号/槽位重复、质量非正、缺少槽位角度;
-- 半径非法。
+- 方案没有已放置试管;
+- 方案物理快照无效(app/snapshot.py 统一解析与交叉核对: 半径非法,
+  槽号重复/缺失/越界, 管号重复, 质量非正, 角度缺失或非有限,
+  槽位状态与摆放明细的占用关系互相矛盾等), 在任何搜索之前拒绝。
 """
 from __future__ import annotations
 
 import math
 from typing import Any, Optional
 
+from .snapshot import mr_block, mr_vector, parse_plan_snapshot
+
 # 精确枚举规模上限: 待换管 4 支、备品 12 支(排列数 P(12,4)=11880)
 MAX_REPLACE = 4
 MAX_SPARES = 12
 # 与 app/evacuation.py / app/counterweight.py 一致的数值容差
 _NUM_TOL = 1e-9
-
-
-def _vec_block(x: float, y: float) -> dict[str, Any]:
-    return {
-        "u1_x_g_mm": x,
-        "u1_y_g_mm": y,
-        "u1_mag_g_mm": math.hypot(x, y),
-        "u1_angle_deg": math.degrees(math.atan2(y, x)) % 360.0,
-    }
 
 
 def _as_int(raw: Any, what: str) -> int:
@@ -110,15 +105,11 @@ def plan_spare_replacement(plan: dict[str, Any],
     if limit < 0.0:
         raise ValueError("一阶不平衡量限值不能为负。")
 
-    # ---- 半径 / 转速 ----
+    # ---- 方案物理快照(半径/槽角/占用/试管, 搜索前统一交叉核对) ----
+    snap = parse_plan_snapshot(plan)
+    radius = snap.radius_mm
     result = plan.get("result") or {}
     cfg = result.get("config") or {}
-    radius = cfg.get("radius_mm")
-    if radius is None:
-        radius = (plan.get("request") or {}).get("radius_mm", 100.0)
-    radius = float(radius)
-    if not math.isfinite(radius) or radius <= 0.0:
-        raise ValueError("方案中的转子半径必须为正数。")
     rpm = float(cfg.get("rpm", (plan.get("request") or {}).get("rpm", 0.0)))
     omega = 2.0 * math.pi * rpm / 60.0
 
@@ -136,53 +127,32 @@ def plan_spare_replacement(plan: dict[str, Any],
             raise ValueError(f"待换管 {tid} 重复选择。")
         replaced_ids.append(tid)
 
-    # ---- 摆放明细 ----
-    used = [p for p in (result.get("placements") or [])
-            if p.get("slot") is not None]
-    if not used:
+    # ---- 已放置试管(快照已核对管号/落槽/占用一致) ----
+    if not snap.tubes:
         raise ValueError(
             f"方案 {plan_id} 没有已放置的试管, 无法进行备品试管替换。"
         )
     placed: dict[int, dict[str, Any]] = {}
-    seen_slots: set[int] = set()
     base_x = base_y = 0.0
     base_total_mass = 0.0
-    for p in used:
-        tid = _as_int(p.get("tube_id"), "摆放明细中的试管编号")
-        if tid in placed:
-            raise ValueError(f"摆放明细中试管 {tid} 重复。")
-        slot = _as_int(p.get("slot"), f"试管 {tid} 的槽位")
-        if slot in seen_slots:
-            raise ValueError(f"摆放明细中槽位 {slot} 被重复占用。")
-        seen_slots.add(slot)
-        mass = float(p.get("mass"))
-        if not math.isfinite(mass) or mass <= 0.0:
-            raise ValueError(f"试管 {tid} 的标称质量必须为正数。")
-        angle = p.get("angle")
-        if angle is None or not math.isfinite(float(angle)):
-            raise ValueError(f"试管 {tid} 的摆放结果缺少有效槽位角度。")
-        angle_deg = float(angle)
-        a = math.radians(angle_deg)
-        vx = mass * radius * math.cos(a)
-        vy = mass * radius * math.sin(a)
+    for t in snap.tubes:
+        v = mr_vector(t.mass_g, radius, t.angle_deg)
+        vx, vy = v.real, v.imag
         base_x += vx
         base_y += vy
-        base_total_mass += mass
-        placed[tid] = {
-            "tube_id": tid,
-            "mass": mass,
-            "slot": slot,
-            "angle_deg": angle_deg,
-            "locked": bool(p.get("locked", False)),
+        base_total_mass += t.mass_g
+        placed[t.tube_id] = {
+            "tube_id": t.tube_id,
+            "mass": t.mass_g,
+            "slot": t.slot,
+            "angle_deg": t.angle_deg,
+            "locked": t.locked,
             "vec": (vx, vy),
         }
     n = len(placed)
 
     # 原方案全部试管编号(含未放置的), 备品编号不得与之冲突
-    original_ids = set(placed)
-    for p in (result.get("placements") or []):
-        if p.get("tube_id") is not None:
-            original_ids.add(_as_int(p.get("tube_id"), "摆放明细中的试管编号"))
+    original_ids = set(placed) | set(snap.unplaced_tube_ids)
     for t in ((plan.get("request") or {}).get("tubes") or []):
         if isinstance(t, dict) and t.get("id") is not None:
             original_ids.add(_as_int(t.get("id"), "方案试管编号"))
@@ -249,15 +219,15 @@ def plan_spare_replacement(plan: dict[str, Any],
             "locked": t["locked"],
             "slot": t["slot"],
             "angle_deg": t["angle_deg"],
-            "u1": _vec_block(vx, vy),
+            "u1": mr_block(vx, vy),
         })
     unchanged_rows.sort(key=lambda r: r["slot"])
 
     # 待换管原槽方向的单位质径积向量 R·e^{iθ}
     rep_dirs = []
     for tid in replaced_ids:
-        a = math.radians(placed[tid]["angle_deg"])
-        rep_dirs.append((radius * math.cos(a), radius * math.sin(a)))
+        v = mr_vector(1.0, radius, placed[tid]["angle_deg"])
+        rep_dirs.append((v.real, v.imag))
 
     # ---- 备品不重复使用的一对一完全枚举(排列) ----
     # 叶子: (|U₁|, 总质量差 D, 备品编号序列(按待换管号升序位置))
@@ -329,10 +299,9 @@ def plan_spare_replacement(plan: dict[str, Any],
         tid = replaced_ids[pos]
         t = placed[tid]
         smass = spare_by_id[sid]
-        a = math.radians(t["angle_deg"])
         ovx, ovy = t["vec"]
-        fvx = smass * radius * math.cos(a)
-        fvy = smass * radius * math.sin(a)
+        fv = mr_vector(smass, radius, t["angle_deg"])
+        fvx, fvy = fv.real, fv.imag
         final_x += fvx
         final_y += fvy
         diff = smass - t["mass"]
@@ -349,14 +318,14 @@ def plan_spare_replacement(plan: dict[str, Any],
             "spare_mass_g": smass,
             "mass_diff_g": diff,
             "abs_mass_diff_g": abs(diff),
-            "original_u1": _vec_block(ovx, ovy),
-            "final_u1": _vec_block(fvx, fvy),
-            "u1_change": _vec_block(fvx - ovx, fvy - ovy),
+            "original_u1": mr_block(ovx, ovy),
+            "final_u1": mr_block(fvx, fvy),
+            "u1_change": mr_block(fvx - ovx, fvy - ovy),
         })
 
     final_total_mass = base_total_mass - replaced_mass_before + replaced_mass_after
-    baseline_block = _vec_block(base_x, base_y)
-    final_block = _vec_block(final_x, final_y)
+    baseline_block = mr_block(base_x, base_y)
+    final_block = mr_block(final_x, final_y)
     base_mag = baseline_block["u1_mag_g_mm"]
     final_mag = final_block["u1_mag_g_mm"]
 

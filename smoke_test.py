@@ -1259,6 +1259,33 @@ assert sp_after["result"]["metrics"]["u1_mag_g_mm"] == \
        rec_sp["result"]["metrics"]["u1_mag_g_mm"]
 print("spare-replacement validation/read-only OK")
 
+# ---- 已保存方案物理快照校验(失效槽迁移/配重补偿/备品替换共用, 只读) ----
+# 直接篡改落库结果: 槽位状态登记的占用管在摆放明细中不存在(占用关系矛盾),
+# 三个接口必须在任何搜索之前返回明确的 400, 不得生成错误的达标建议
+with main.db() as conn:
+    _row = conn.execute("SELECT result_json FROM plans WHERE id=?",
+                        (spid,)).fetchone()
+    _res = json.loads(_row["result_json"])
+    _occ = next(s for s in _res["slot_state"] if s["tube_id"] is not None)
+    _occ["tube_id"] = 99999
+    conn.execute("UPDATE plans SET result_json=? WHERE id=?",
+                 (json.dumps(_res, ensure_ascii=False), spid))
+for _bad_call in (
+    lambda: ev_call(spid, [3], 1.0, 1),
+    lambda: cw_call(spid, [(5, 1)], 100.0, 1),
+    lambda: sp_call(spid, [1], [(10, 50.0)], 100.0),
+):
+    try:
+        _bad_call(); raise SystemExit("should 400: invalid snapshot")
+    except main.HTTPException as e:
+        assert e.status_code == 400 and "矛盾" in str(e.detail), e.detail
+# 快照校验只读: 拒绝后落库数据保持(篡改后的)原样, 未被规划调用改写
+with main.db() as conn:
+    _row2 = conn.execute("SELECT result_json FROM plans WHERE id=?",
+                         (spid,)).fetchone()
+    assert json.loads(_row2["result_json"])["slot_state"] == _res["slot_state"]
+print("snapshot-validation 400-before-search/read-only OK")
+
 
 # ---- 互斥试管隔离(精确完全枚举; 禁用槽仍占物理相邻关系) ----
 import itertools as _itx

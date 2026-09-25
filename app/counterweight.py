@@ -46,12 +46,16 @@
 - 限值不是有限非负数, 或最多放置枚数不在 0~3;
 - 配重种类为空或超过 6 种; 配重质量非正/非有限; 库存件数非整数或为负;
 - 方案没有已放置试管; 空闲启用槽位超过 16 个(精确枚举规模上限);
-- 摆放明细中试管编号/槽位重复、质量非正、缺少槽位角度; 半径非法。
+- 方案物理快照无效(app/snapshot.py 统一解析与交叉核对: 半径非法,
+  槽号重复/缺失/越界, 管号重复, 质量非正, 角度缺失或非有限,
+  槽位状态与摆放明细的占用关系互相矛盾等), 在任何搜索之前拒绝。
 """
 from __future__ import annotations
 
 import math
 from typing import Any, Optional
+
+from .snapshot import mr_block, mr_vector, parse_plan_snapshot
 
 # 精确枚举规模上限: 空闲启用槽 16 个、配重 6 种、放置上限 3 枚
 # (叶子数 Σ_{k=0..3} C(16,k)·6^k ≈ 12.6 万)
@@ -60,15 +64,6 @@ MAX_WEIGHT_TYPES = 6
 MAX_WEIGHTS = 3
 # 与 app/evacuation.py / app/reweigh.py 一致的数值容差
 _NUM_TOL = 1e-9
-
-
-def _vec_block(x: float, y: float) -> dict[str, Any]:
-    return {
-        "u1_x_g_mm": x,
-        "u1_y_g_mm": y,
-        "u1_mag_g_mm": math.hypot(x, y),
-        "u1_angle_deg": math.degrees(math.atan2(y, x)) % 360.0,
-    }
 
 
 def plan_counterweight_compensation(
@@ -148,62 +143,26 @@ def plan_counterweight_compensation(
         {"mass_g": m, "stock": stock_by_mass[m]} for m in usable_masses
     ]
 
-    # ---- 半径 ----
-    result = plan.get("result") or {}
-    cfg = result.get("config") or {}
-    radius = cfg.get("radius_mm")
-    if radius is None:
-        radius = (plan.get("request") or {}).get("radius_mm", 100.0)
-    radius = float(radius)
-    if not math.isfinite(radius) or radius <= 0.0:
-        raise ValueError("方案中的转子半径必须为正数。")
+    # ---- 方案物理快照(半径/槽角/占用/试管, 搜索前统一交叉核对) ----
+    snap = parse_plan_snapshot(plan)
+    radius = snap.radius_mm
 
-    # ---- 摆放明细(补偿前不平衡量) ----
-    used = [p for p in (result.get("placements") or [])
-            if p.get("slot") is not None]
-    if not used:
+    # ---- 已放置试管与补偿前不平衡量(共用质径积向量计算) ----
+    if not snap.tubes:
         raise ValueError(
             f"方案 {plan_id} 没有已放置的试管, 无法进行库存配重补偿。"
         )
-    seen_ids: set[int] = set()
-    seen_slots: set[int] = set()
-    base_x = base_y = 0.0
-    for p in used:
-        tid = int(p["tube_id"])
-        if tid in seen_ids:
-            raise ValueError(f"摆放明细中试管 {tid} 重复。")
-        seen_ids.add(tid)
-        slot = int(p["slot"])
-        if slot in seen_slots:
-            raise ValueError(f"摆放明细中槽位 {slot} 被重复占用。")
-        seen_slots.add(slot)
-        mass = float(p["mass"])
-        if not math.isfinite(mass) or mass <= 0.0:
-            raise ValueError(f"试管 {tid} 的标称质量必须为正数。")
-        angle = p.get("angle")
-        if angle is None or not math.isfinite(float(angle)):
-            raise ValueError(f"试管 {tid} 的摆放结果缺少有效槽位角度。")
-        a = math.radians(float(angle))
-        base_x += mass * radius * math.cos(a)
-        base_y += mass * radius * math.sin(a)
-    tube_count = len(used)
-    baseline_block = _vec_block(base_x, base_y)
+    tube_count = len(snap.tubes)
+    base = sum(
+        (mr_vector(t.mass_g, radius, t.angle_deg) for t in snap.tubes), 0j
+    )
+    base_x, base_y = base.real, base.imag
+    baseline_block = mr_block(base_x, base_y)
 
-    # ---- 空闲启用槽位(以方案结果 slot_state 为准) ----
-    slot_state = result.get("slot_state") or []
-    if not slot_state:
-        raise ValueError(
-            f"方案 {plan_id} 缺少槽位状态信息, 无法进行库存配重补偿。"
-        )
-    free_slots: list[dict[str, Any]] = []
-    for item in slot_state:
-        idx = int(item["slot"])
-        ang = float(item["angle"])
-        if not math.isfinite(ang):
-            raise ValueError(f"槽位 {idx} 的角度必须为有限数值。")
-        if bool(item.get("enabled", True)) and item.get("tube_id") is None:
-            free_slots.append({"slot": idx, "angle_deg": ang})
-    free_slots.sort(key=lambda f: f["slot"])
+    # ---- 空闲启用槽位(以快照为准) ----
+    free_slots: list[dict[str, Any]] = [
+        {"slot": s.slot, "angle_deg": s.angle_deg} for s in snap.free_slots
+    ]
     q = len(free_slots)
     if q > MAX_FREE_SLOTS:
         raise ValueError(
@@ -211,11 +170,7 @@ def plan_counterweight_compensation(
             f"{MAX_FREE_SLOTS} 个(精确枚举规模随空槽数增长), 明确拒绝。"
         )
     # 各空槽方向的单位质径积向量 R·e^{iθ}
-    unit_vecs = [
-        complex(radius * math.cos(math.radians(f["angle_deg"])),
-                radius * math.sin(math.radians(f["angle_deg"])))
-        for f in free_slots
-    ]
+    unit_vecs = [mr_vector(1.0, radius, f["angle_deg"]) for f in free_slots]
 
     # ---- 按放置枚数分层的完全枚举 ----
     # 叶子: (残余 |U₁|, (槽号升序槽位序列, 对应配重质量序列))
@@ -302,9 +257,8 @@ def plan_counterweight_compensation(
     placements_out: list[dict[str, Any]] = []
     ux, uy = base_x, base_y
     for slot, mass in zip(chosen_slots, chosen_masses):
-        a = math.radians(angle_of[slot])
-        vx = mass * radius * math.cos(a)
-        vy = mass * radius * math.sin(a)
+        v = mr_vector(mass, radius, angle_of[slot])
+        vx, vy = v.real, v.imag
         ux += vx
         uy += vy
         placements_out.append({
@@ -315,7 +269,7 @@ def plan_counterweight_compensation(
             "u1_y_g_mm": vy,
             "u1_mag_g_mm": math.hypot(vx, vy),
         })
-    final_block = _vec_block(ux, uy)
+    final_block = mr_block(ux, uy)
     final_mag = final_block["u1_mag_g_mm"]
 
     feasible = winner is not None
